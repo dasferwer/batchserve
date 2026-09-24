@@ -23,4 +23,8 @@ def init():
                 output_key text, status text NOT NULL DEFAULT 'pending', token uuid,
                 lease_until timestamptz, attempts integer NOT NULL DEFAULT 0, error text,
                 PRIMARY KEY(job_id,number));
+            ALTER TABLE batches ADD COLUMN IF NOT EXISTS started_at timestamptz;
+            CREATE TABLE IF NOT EXISTS job_events (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,job_id uuid REFERENCES jobs(id),
+                action text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
         """)

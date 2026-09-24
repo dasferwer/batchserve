@@ -170,10 +170,42 @@ def status(identity: uuid.UUID, owner: Annotated[str, Depends(tenant)]):
 def cancel(identity: uuid.UUID, owner: Annotated[str, Depends(tenant)]):
     get_job(identity, owner)
     with connect() as conn:
-        conn.execute(
-            "UPDATE jobs SET status='cancelled' WHERE id=%s AND status='running'", (identity,)
-        )
+        changed = conn.execute(
+            "UPDATE jobs SET status='cancelled' WHERE id=%s AND status='running' RETURNING id",
+            (identity,),
+        ).fetchone()
+        if changed:
+            conn.execute(
+                "UPDATE batches SET status='pending',token=NULL,lease_until=NULL WHERE job_id=%s AND status='running'",
+                (identity,),
+            )
+            conn.execute("INSERT INTO job_events(job_id,action) VALUES (%s,'cancel')", (identity,))
     return get_job(identity, owner)
+
+
+@app.post("/jobs/{identity}/resume")
+def resume(identity: uuid.UUID, owner: Annotated[str, Depends(tenant)]):
+    get_job(identity, owner)
+    with connect() as conn:
+        job = conn.execute("SELECT status FROM jobs WHERE id=%s FOR UPDATE", (identity,)).fetchone()
+        if job["status"] not in ("cancelled", "failed"):
+            raise HTTPException(409, "Продолжить можно отменённое или неудачное задание")
+        conn.execute(
+            "UPDATE batches SET status='pending',token=NULL,lease_until=NULL,attempts=0,error=NULL WHERE job_id=%s AND status<>'completed'",
+            (identity,),
+        )
+        conn.execute("UPDATE jobs SET status='running' WHERE id=%s", (identity,))
+        conn.execute("INSERT INTO job_events(job_id,action) VALUES (%s,'resume')", (identity,))
+    return get_job(identity, owner)
+
+
+@app.get("/jobs/{identity}/events")
+def events(identity: uuid.UUID, owner: Annotated[str, Depends(tenant)]):
+    get_job(identity, owner)
+    with connect() as conn:
+        return conn.execute(
+            "SELECT action,created_at FROM job_events WHERE job_id=%s ORDER BY id", (identity,)
+        ).fetchall()
 
 
 @app.get("/jobs/{identity}/result")

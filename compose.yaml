@@ -13,7 +13,7 @@ services:
       timeout: 2s
       retries: 30
   storage:
-    image: quay.io/minio/minio:latest
+    build: ./minio
     command: server /data
     environment:
       MINIO_ROOT_USER: demo-access

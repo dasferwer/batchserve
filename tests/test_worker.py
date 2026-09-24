@@ -87,3 +87,81 @@ def test_other_client_cannot_read_cancel_or_download(client):
     assert client.post(f"/jobs/{identity}/cancel", headers=headers).status_code == 404
     assert client.get(f"/jobs/{identity}/result", headers=headers).status_code == 404
     assert client.get(f"/jobs/{identity}/result").status_code == 409
+
+
+def test_heartbeat_cannot_revive_expired_or_stale_owner(client):
+    from batchserve.worker import renew
+
+    job(batches=1)
+    task = claim()
+    assert renew(task)
+    expire(task)
+    assert not renew(task)
+    replacement = claim()
+    assert not renew(task)
+    assert renew(replacement)
+
+
+def test_resume_reuses_completed_batches_and_fences_cancelled_owner(client):
+    identity = job(batches=2)
+    first = claim()
+    complete(first, "preserved")
+    old = claim()
+    client.post(f"/jobs/{identity}/cancel")
+    assert client.post(f"/jobs/{identity}/resume").json()["batches"]["completed"] == 1
+    assert not complete(old, "cancelled-owner")
+    new = claim()
+    assert new["number"] == 1
+    assert complete(new, "replacement")
+    assert [r["action"] for r in client.get(f"/jobs/{identity}/events").json()] == [
+        "cancel",
+        "resume",
+    ]
+    assert client.post(f"/jobs/{identity}/resume").status_code == 409
+
+
+def test_crashed_attempts_are_bounded_and_can_be_retried_explicitly(client):
+    identity = job(batches=1)
+    for _ in range(3):
+        task = claim()
+        expire(task)
+    assert claim() is None
+    assert client.get(f"/jobs/{identity}").json()["status"] == "failed"
+    assert client.post(f"/jobs/{identity}/resume").status_code == 200
+    assert claim()
+
+
+def test_execution_deadline_limits_heartbeat(client):
+    from batchserve.worker import renew
+
+    job(batches=1)
+    task = claim()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE batches SET started_at=clock_timestamp()-interval '6 minutes' WHERE job_id=%s",
+            (task["job_id"],),
+        )
+    assert not renew(task)
+    assert not complete(task, "too-long")
+
+
+def test_execution_renews_lease_while_inference_is_busy(client, monkeypatch):
+    import time
+
+    from batchserve import worker
+
+    identity = job(batches=1)
+    task = claim()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE batches SET lease_until=clock_timestamp()+interval '0.3 seconds' WHERE job_id=%s",
+            (identity,),
+        )
+
+    def inference(batch):
+        time.sleep(0.5)
+        return complete(batch, "long-inference")
+
+    monkeypatch.setattr(worker, "_execute", inference)
+    assert worker.execute(task, heartbeat_interval=0.05)
+    assert client.get(f"/jobs/{identity}").json()["status"] == "completed"
