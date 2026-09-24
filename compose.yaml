@@ -1,0 +1,54 @@
+services:
+  database:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: batchserve
+    ports: ["127.0.0.1:54833:5432"]
+    volumes: ["database:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d batchserve"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  storage:
+    image: quay.io/minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: demo-access
+      MINIO_ROOT_PASSWORD: demo-secret-key
+    ports: ["127.0.0.1:9033:9000"]
+    volumes: ["objects:/data"]
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: demo
+      RABBITMQ_DEFAULT_PASS: demo
+    ports: ["127.0.0.1:5633:5672"]
+  api:
+    build: .
+    environment: &environment
+      DATABASE_URL: postgresql://demo:demo@database/batchserve
+      CLIENT_KEYS: '{"demo-a-key":"client-a","demo-b-key":"client-b"}'
+      S3_ENDPOINT: http://storage:9000
+      AWS_ACCESS_KEY_ID: demo-access
+      AWS_SECRET_ACCESS_KEY: demo-secret-key
+      S3_BUCKET: batches
+      AMQP_URL: amqp://demo:demo@rabbitmq:5672/%2F
+    ports: ["127.0.0.1:8093:8000"]
+    depends_on:
+      database: {condition: service_healthy}
+      storage: {condition: service_started}
+      rabbitmq: {condition: service_started}
+  worker:
+    build: .
+    command: ["python", "-m", "batchserve.worker"]
+    environment: *environment
+    depends_on:
+      database: {condition: service_healthy}
+      storage: {condition: service_started}
+      rabbitmq: {condition: service_started}
+volumes:
+  database:
+  objects:
