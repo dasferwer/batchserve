@@ -1,11 +1,17 @@
 import os
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 
 def client():
-    return boto3.client("s3", endpoint_url=os.environ["S3_ENDPOINT"], region_name="us-east-1")
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ["S3_ENDPOINT"],
+        region_name="us-east-1",
+        config=Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 2}),
+    )
 
 
 def bucket():

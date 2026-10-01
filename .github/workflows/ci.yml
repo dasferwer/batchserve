@@ -40,5 +40,9 @@ jobs:
             sleep 2
           done
           uv run python -m scripts.recovery
+      - name: Очистка непринятых загрузок после отказа S3 и остановки API
+        env:
+          DATABASE_URL: postgresql://demo:demo@localhost:54833/batchserve
+        run: uv run python -m scripts.staging_recovery
       - if: always()
         run: docker compose down

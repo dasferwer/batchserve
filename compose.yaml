@@ -36,6 +36,7 @@ services:
       AWS_SECRET_ACCESS_KEY: demo-secret-key
       S3_BUCKET: batches
       AMQP_URL: amqp://demo:demo@rabbitmq:5672/%2F
+      STAGING_TTL_SECONDS: ${STAGING_TTL_SECONDS:-300}
     ports: ["127.0.0.1:8093:8000"]
     depends_on:
       database: {condition: service_healthy}
@@ -49,6 +50,14 @@ services:
       database: {condition: service_healthy}
       storage: {condition: service_started}
       rabbitmq: {condition: service_started}
+  staging-cleaner:
+    build: .
+    command: ["python", "-m", "batchserve.staging"]
+    environment: *environment
+    restart: unless-stopped
+    depends_on:
+      database: {condition: service_healthy}
+      storage: {condition: service_started}
 volumes:
   database:
   objects:

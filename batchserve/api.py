@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from batchserve.db import connect, init
 from batchserve.model import VERSIONS
+from batchserve.staging import abandon, adopt, register_part, staged_request
 from batchserve.storage import bucket, client, upload
 
 
@@ -90,62 +91,67 @@ def create(
         if existing["fingerprint"] != fingerprint:
             raise HTTPException(409, "Ключ уже использован для других данных или модели")
         return get_job(existing["id"], owner)
-    identity, staging = uuid.uuid4(), uuid.uuid4()
-    reader = csv.DictReader(io.TextIOWrapper(file.file, encoding="utf-8-sig", newline=""))
+    identity = uuid.uuid4()
     parts = []
     total = 0
     try:
-        if reader.fieldnames != ["id", "x1", "x2"]:
-            raise ValueError("Нужен заголовок id,x1,x2 в указанном порядке")
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "part.json"
-            while rows := list(islice(reader, 1000)):
-                batch = []
-                for row in rows:
-                    if None in row or any(value is None for value in row.values()):
-                        raise ValueError("Неверное число полей")
-                    x1, x2 = float(row["x1"]), float(row["x2"])
-                    if (
-                        not row["id"]
-                        or len(row["id"]) > 120
-                        or not all(math.isfinite(x) and abs(x) <= 1e6 for x in (x1, x2))
-                    ):
-                        raise ValueError("Некорректный идентификатор или числовой признак")
-                    batch.append({"id": row["id"], "x1": x1, "x2": x2})
-                total += len(batch)
-                if total > 1000000:
-                    raise ValueError("Лимит задания: миллион строк")
-                key = f"inputs/{staging}/{len(parts)}"
-                path.write_text(json.dumps(batch))
-                upload(path, key)
-                parts.append(key)
-        if not total:
-            raise ValueError("Файл пуст")
+        with staged_request(owner, idempotency_key, fingerprint) as (conn, staging):
+            reader = csv.DictReader(io.TextIOWrapper(file.file, encoding="utf-8-sig", newline=""))
+            if reader.fieldnames != ["id", "x1", "x2"]:
+                raise ValueError("Нужен заголовок id,x1,x2 в указанном порядке")
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "part.json"
+                while rows := list(islice(reader, 1000)):
+                    batch = []
+                    for row in rows:
+                        if None in row or any(value is None for value in row.values()):
+                            raise ValueError("Неверное число полей")
+                        x1, x2 = float(row["x1"]), float(row["x2"])
+                        if (
+                            not row["id"]
+                            or len(row["id"]) > 120
+                            or not all(math.isfinite(x) and abs(x) <= 1e6 for x in (x1, x2))
+                        ):
+                            raise ValueError("Некорректный идентификатор или числовой признак")
+                        batch.append({"id": row["id"], "x1": x1, "x2": x2})
+                    total += len(batch)
+                    if total > 1000000:
+                        raise ValueError("Лимит задания: миллион строк")
+                    path.write_text(json.dumps(batch))
+                    key = register_part(conn, staging, len(parts))
+                    upload(path, key)
+                    parts.append(key)
+            if not total:
+                raise ValueError("Файл пуст")
+            # Принятие задания, всех частей и manifest имеет один commit.
+            with conn.transaction():
+                inserted = conn.execute(
+                    """INSERT INTO jobs (id,tenant,model,request_key,fingerprint,total)
+                    VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (tenant,request_key) DO NOTHING RETURNING id""",
+                    (identity, owner, model, idempotency_key, fingerprint, total),
+                ).fetchone()
+                if inserted:
+                    with conn.cursor() as cursor:
+                        cursor.executemany(
+                            "INSERT INTO batches (job_id,number,input_key) VALUES (%s,%s,%s)",
+                            [(identity, i, key) for i, key in enumerate(parts)],
+                        )
+                    adopt(conn, staging, identity)
+                else:
+                    existing = conn.execute(
+                        "SELECT id,fingerprint FROM jobs WHERE tenant=%s AND request_key=%s",
+                        (owner, idempotency_key),
+                    ).fetchone()
+                    if existing["fingerprint"] != fingerprint:
+                        raise HTTPException(409, "Ключ уже использован для других данных")
+                    abandon(conn, staging, "idempotency_loser")
+                    identity = existing["id"]
+    except HTTPException:
+        raise
     except (ValueError, csv.Error) as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(503, "Не удалось сохранить входные пакеты") from exc
-    with connect() as conn:
-        conn.execute("INSERT INTO tenants (id) VALUES (%s) ON CONFLICT DO NOTHING", (owner,))
-        inserted = conn.execute(
-            """INSERT INTO jobs (id,tenant,model,request_key,fingerprint,total)
-            VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (tenant,request_key) DO NOTHING RETURNING id""",
-            (identity, owner, model, idempotency_key, fingerprint, total),
-        ).fetchone()
-        if inserted:
-            with conn.cursor() as cursor:
-                cursor.executemany(
-                    "INSERT INTO batches (job_id,number,input_key) VALUES (%s,%s,%s)",
-                    [(identity, i, key) for i, key in enumerate(parts)],
-                )
-        else:
-            existing = conn.execute(
-                "SELECT id,fingerprint FROM jobs WHERE tenant=%s AND request_key=%s",
-                (owner, idempotency_key),
-            ).fetchone()
-            if existing["fingerprint"] != fingerprint:
-                raise HTTPException(409, "Ключ уже использован для других данных")
-            identity = existing["id"]
     try:
         with pika.BlockingConnection(pika.URLParameters(os.environ["AMQP_URL"])) as broker:
             channel = broker.channel()
